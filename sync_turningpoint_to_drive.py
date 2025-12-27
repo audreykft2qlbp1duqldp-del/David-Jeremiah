@@ -257,11 +257,11 @@ def ensure_folder(service, folder_id: str) -> Optional[str]:
         return None
 
 def drive_find_by_name(service, folder_id: str, name: str) -> Optional[str]:
-    q = " and ".join([
-        f"name='{name.replace(\"'\", \"\\\\'\")}'",
-        f"'{folder_id}' in parents",
-        "trashed=false",
-    ])
+    # Escape dấu ' cho Drive query
+    escaped_name = name.replace("'", "\\'")
+
+    q = f"name='{escaped_name}' and '{folder_id}' in parents and trashed=false"
+
     res = service.files().list(
         q=q,
         fields="files(id,name)",
@@ -269,8 +269,10 @@ def drive_find_by_name(service, folder_id: str, name: str) -> Optional[str]:
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
     ).execute()
+
     files = res.get("files", [])
     return files[0]["id"] if files else None
+
 
 def drive_download_text(service, file_id: str) -> str:
     req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
