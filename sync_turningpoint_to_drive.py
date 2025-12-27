@@ -1,460 +1,562 @@
 # -*- coding: utf-8 -*-
 """
-Turning Point Radio (TWR360 ministry 23) -> tải audio mới nhất (public) -> upload Google Drive
-- Không dùng RSS (RSS bạn nhận entries=0).
-- Parse từ trang ministry -> lấy link Listen (action,audio) -> lấy link Downloads/Audio (mediahit) -> decode ra URL mp3 -> tải -> upload.
-- State lưu trên Drive: state.json (tránh commit/push -> khỏi dính 403).
+Sync newest Turning Point Radio (Dr. David Jeremiah) episodes from TWR360 to Google Drive.
+
+Key fix:
+- DO NOT scrape "Listen" (action,audio) page for mediahit. It often doesn't contain download URL.
+- Scrape the PROGRAM VIEW page and extract Downloads -> Audio (mediahit), then decode base64 to get direct MP3 URL.
+
+State:
+- state.json is stored in the same Drive folder (GDRIVE_FOLDER_ID). No git push needed.
 """
 
-from __future__ import annotations
-
-import base64
-import datetime as dt
-import io
-import json
 import os
 import re
+import io
+import json
 import time
+import base64
+import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Set, Tuple, List
-from urllib.parse import urljoin, unquote
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
-from google.oauth2.credentials import Credentials
+
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
 
-# =========================
-# Config
-# =========================
-MINISTRY_URL = "https://www.twr360.org/ministry/23/turning-point-radio/?lang=1"
-STATE_DRIVE_NAME = "state.json"
 
-MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "10"))
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "3"))
-TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+# ================== CONFIG ==================
+MINISTRY_URL = os.environ.get(
+    "MINISTRY_URL",
+    "https://www.twr360.org/ministry/23/turning-point-radio/?lang=1"
+).strip()
 
-OUT_DIR = Path(os.getenv("OUT_DIR", "out")).resolve()
+RSS_URL = os.environ.get(
+    "RSS_URL",
+    "https://www.twr360.org/programs/rss/ministry_id,23"
+).strip()
+
+OUT_DIR = Path(os.environ.get("OUT_DIR", "out")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-UA = (
+MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "10"))
+SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "2"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "40"))
+
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
+STATE_DRIVE_NAME = os.environ.get("STATE_DRIVE_NAME", "state.json").strip()
+
+# A reasonably “real” UA reduces weird server responses
+HTTP_UA = os.environ.get(
+    "HTTP_UA",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-)
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+).strip()
 
-SCOPES_DEFAULT = ["https://www.googleapis.com/auth/drive"]
 
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    }
-)
-
-# =========================
-# Models
-# =========================
+# ================== DATA ==================
 @dataclass
 class Episode:
     program_id: str
-    listen_url: str
+    program_url: str
+    title_hint: str = ""
 
 
-# =========================
-# HTTP
-# =========================
-def http_get_text(url: str) -> Tuple[int, str]:
-    r = SESSION.get(url, timeout=TIMEOUT)
+# ================== HTTP ==================
+def http_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": HTTP_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    return s
+
+
+def fetch_text(s: requests.Session, url: str) -> Tuple[int, str]:
+    r = s.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
     return r.status_code, r.text
 
 
-def download_file(url: str, out_path: Path) -> None:
-    with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
+def fetch_bytes(s: requests.Session, url: str) -> Tuple[int, bytes, str]:
+    r = s.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True, stream=True)
+    ctype = r.headers.get("content-type", "")
+    return r.status_code, r.content, ctype
+
+
+# ================== PARSE LIST ==================
+def uniq_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def parse_program_ids_from_ministry(html: str) -> List[Episode]:
+    """
+    Parse program IDs from ministry page (Recent list).
+    We prefer program view URLs (not action,audio).
+    """
+    # Grab all programs/view links
+    # Examples:
+    #   /programs/view/id%2C1146101/lang%2C1
+    #   https://www.twr360.org/programs/view/id,1146101/
+    pattern = re.compile(r"""href=["']([^"']*?/programs/view/id(?:%2C|,)(\d+)[^"']*)["']""", re.I)
+    matches = pattern.findall(html)
+
+    eps: List[Episode] = []
+    for href, pid in matches:
+        # Ignore "action,audio" pages; we want the main program view page
+        if re.search(r"(?:action(?:%2C|,))audio", href, re.I):
+            continue
+
+        full_url = href
+        if full_url.startswith("/"):
+            full_url = urljoin("https://www.twr360.org", full_url)
+        elif full_url.startswith("www."):
+            full_url = "https://" + full_url
+
+        # Ensure English lang=1 if missing (optional, but stable)
+        if "lang" not in full_url:
+            # safest: append trailing slash then lang
+            if not full_url.endswith("/"):
+                full_url += "/"
+            full_url = urljoin(full_url, "lang,1")
+
+        eps.append(Episode(program_id=str(pid), program_url=full_url))
+
+    # Keep order, unique by program_id
+    seen = set()
+    out: List[Episode] = []
+    for e in eps:
+        if e.program_id in seen:
+            continue
+        seen.add(e.program_id)
+        out.append(e)
+
+    return out
+
+
+def parse_program_ids_from_rss(raw: bytes) -> List[Episode]:
+    """
+    RSS is sometimes served with odd content-type, but body includes item links.
+    We extract program view URLs from it.
+    """
+    text = raw.decode("utf-8", errors="ignore")
+
+    # Extract program URLs like https://www.twr360.org/programs/view/id,1146101/
+    urls = re.findall(r"https?://www\.twr360\.org/programs/view/id,\d+/?", text, flags=re.I)
+    urls = uniq_keep_order(urls)
+
+    eps: List[Episode] = []
+    for u in urls:
+        m = re.search(r"id,(\d+)", u)
+        if not m:
+            continue
+        pid = m.group(1)
+        # add lang=1 for consistency
+        if not u.endswith("/"):
+            u += "/"
+        u = urljoin(u, "lang,1")
+        eps.append(Episode(program_id=pid, program_url=u))
+    return eps
+
+
+def get_latest_episodes(s: requests.Session) -> List[Episode]:
+    # Try RSS first (usually most stable)
+    try:
+        st, raw, ctype = fetch_bytes(s, RSS_URL)
+        print(f"[RSS] status={st} bytes={len(raw)} ctype={ctype}")
+        if st == 200 and len(raw) > 500:
+            eps = parse_program_ids_from_rss(raw)
+            if eps:
+                print(f"[RSS] Parsed {len(eps)} episode(s).")
+                return eps
+    except Exception as e:
+        print(f"[RSS] Failed: {e}")
+
+    # Fallback: ministry page
+    st, html = fetch_text(s, MINISTRY_URL)
+    print(f"[Fetch] {MINISTRY_URL}")
+    print(f"[Fetch] status={st} bytes={len(html)}")
+    if st != 200 or len(html) < 1000:
+        raise RuntimeError(f"Cannot fetch ministry page (status={st}, bytes={len(html)})")
+    eps = parse_program_ids_from_ministry(html)
+    print(f"[Parse] Found {len(eps)} episode(s) from ministry page.")
+    return eps
+
+
+# ================== PARSE PROGRAM PAGE ==================
+def strip_tags(x: str) -> str:
+    x = re.sub(r"<[^>]+>", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def extract_title_and_date(html: str, fallback_title: str = "") -> Tuple[str, str]:
+    """
+    Return (title, date_yyyy_mm_dd or "").
+    Date appears in page text like 'December 27, 2025'.
+    """
+    title = ""
+    # <h1 ...>Title</h1>
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.I | re.S)
+    if m:
+        title = strip_tags(m.group(1))
+
+    if not title:
+        # meta og:title
+        m2 = re.search(r"""property=["']og:title["']\s+content=["']([^"']+)["']""", html, flags=re.I)
+        if m2:
+            title = m2.group(1).strip()
+
+    if not title:
+        title = fallback_title.strip() or "episode"
+
+    # Date like "December 27, 2025"
+    date_txt = ""
+    md = re.search(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b", html)
+    if md:
+        date_txt = md.group(0)
+
+    yyyy_mm_dd = ""
+    if date_txt:
+        try:
+            d = dt.datetime.strptime(date_txt, "%B %d, %Y").date()
+            yyyy_mm_dd = d.isoformat()
+        except Exception:
+            yyyy_mm_dd = ""
+
+    return title, yyyy_mm_dd
+
+
+def find_mediahit_links(html: str, base_url: str) -> List[str]:
+    """
+    Find candidate mediahit URLs in raw HTML attributes.
+    """
+    links = re.findall(r"""href\s*=\s*["']([^"']*mediahit[^"']+)["']""", html, flags=re.I)
+    links += re.findall(r"""data-href\s*=\s*["']([^"']*mediahit[^"']+)["']""", html, flags=re.I)
+    links = [x.strip() for x in links if x.strip()]
+
+    out = []
+    for x in links:
+        if x.startswith("/"):
+            out.append(urljoin(base_url, x))
+        elif x.startswith("http://") or x.startswith("https://"):
+            out.append(x)
+        else:
+            out.append(urljoin(base_url, x))
+    return uniq_keep_order(out)
+
+
+def decode_mediahit_to_direct_url(mediahit_url: str) -> Optional[str]:
+    """
+    mediahit contains ".../url%2C<base64>..." or after unquote: ".../url,<base64>..."
+    Some use "~" in place of "=" padding.
+    """
+    try:
+        u = unquote(mediahit_url)
+        m = re.search(r"/url,([^/?#]+)", u)
+        if not m:
+            # sometimes still encoded in strange ways
+            m = re.search(r"url%2C([^/?#]+)", mediahit_url, flags=re.I)
+            if not m:
+                return None
+            b64 = m.group(1)
+        else:
+            b64 = m.group(1)
+
+        b64 = b64.replace("~", "=")
+
+        # pad base64
+        pad = (-len(b64)) % 4
+        if pad:
+            b64 += "=" * pad
+
+        raw = base64.b64decode(b64)
+        direct = raw.decode("utf-8", errors="ignore").strip()
+        if direct.startswith("http://") or direct.startswith("https://"):
+            return direct
+        return None
+    except Exception:
+        return None
+
+
+def choose_best_audio_url(candidates: List[str]) -> Optional[str]:
+    """
+    Prefer mp3 audio links.
+    """
+    aud = []
+    for u in candidates:
+        if not u:
+            continue
+        low = u.lower()
+        if ".mp3" in low or "audio" in low:
+            aud.append(u)
+    if aud:
+        return aud[0]
+    return candidates[0] if candidates else None
+
+
+def sanitize_filename(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:180] if len(name) > 180 else name
+
+
+def download_audio(s: requests.Session, audio_url: str, out_path: Path) -> None:
+    with s.get(audio_url, timeout=HTTP_TIMEOUT, stream=True, allow_redirects=True) as r:
         r.raise_for_status()
-        tmp = out_path.with_suffix(out_path.suffix + ".part")
-        with open(tmp, "wb") as f:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
-        tmp.replace(out_path)
 
 
-# =========================
-# Drive
-# =========================
+# ================== DRIVE ==================
+DEFAULT_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
 def load_oauth_from_env() -> Optional[Credentials]:
-    tok = (os.environ.get("GDRIVE_OAUTH_TOKEN_JSON") or "").strip()
+    tok = os.environ.get("GDRIVE_OAUTH_TOKEN_JSON", "").strip()
     if not tok:
-        print("[Drive] Missing GDRIVE_OAUTH_TOKEN_JSON. Skip upload/state.")
         return None
-
     try:
         info = json.loads(tok)
+
+        # IMPORTANT: avoid invalid_scope by respecting token's own scopes if present
+        scopes = info.get("scopes") or info.get("scope")
+        if isinstance(scopes, str):
+            scopes_list = scopes.split()
+        elif isinstance(scopes, list):
+            scopes_list = scopes
+        else:
+            scopes_list = DEFAULT_SCOPES
+
+        return Credentials.from_authorized_user_info(info, scopes_list)
     except Exception as e:
         print(f"[Drive] OAuth token JSON invalid: {e}")
         return None
 
-    scopes = info.get("scopes") or info.get("scope")
-    if isinstance(scopes, str):
-        scopes_list = scopes.split()
-    elif isinstance(scopes, list):
-        scopes_list = scopes
-    else:
-        scopes_list = SCOPES_DEFAULT  # fallback
 
-    try:
-        return Credentials.from_authorized_user_info(info, scopes=scopes_list)
-    except Exception as e:
-        print(f"[Drive] Cannot build Credentials: {e}")
-        return None
-
-
-def init_drive():
+def init_drive_service():
     creds = load_oauth_from_env()
     if not creds:
+        print("[Drive] Missing GDRIVE_OAUTH_TOKEN_JSON. Skip Drive upload.")
         return None
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return build("drive", "v3", credentials=creds)
 
 
-def ensure_folder_access(service, folder_id: str) -> Optional[str]:
+def ensure_folder(service, folder_id: str) -> Optional[str]:
     if not service or not folder_id:
         return None
     try:
-        meta = service.files().get(fileId=folder_id, fields="id,name", supportsAllDrives=True).execute()
+        meta = service.files().get(
+            fileId=folder_id,
+            fields="id,name",
+            supportsAllDrives=True
+        ).execute()
         print(f"[Drive] Folder OK: {meta.get('name')} ({meta.get('id')})")
-        return meta.get("id")
+        return meta["id"]
     except HttpError as e:
-        print(f"[Drive] Cannot access folder {folder_id}: {e}")
+        print(f"[Drive] Cannot access folder_id={folder_id}: {e}")
         return None
+
+
+def drive_escape_q_value(s: str) -> str:
+    # Google Drive query uses single quotes; escape backslash + single quote
+    s = s.replace("\\", "\\\\")
+    s = s.replace("'", "\\'")
+    return s
 
 
 def drive_find_by_name(service, folder_id: str, name: str) -> Optional[str]:
-    escaped_name = name.replace("'", "\\'")
-    q = f"name='{escaped_name}' and '{folder_id}' in parents and trashed=false"
+    safe_name = drive_escape_q_value(name)
+    q = f"name='{safe_name}' and '{folder_id}' in parents and trashed=false"
     res = service.files().list(
         q=q,
-        fields="files(id,name,modifiedTime)",
-        pageSize=10,
+        spaces="drive",
+        fields="files(id,name)",
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
+        pageSize=5
     ).execute()
-    files = res.get("files") or []
-    if not files:
-        return None
-    files.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
-    return files[0]["id"]
+    files = res.get("files", []) or []
+    return files[0]["id"] if files else None
 
 
-def drive_download_text(service, file_id: str) -> str:
+def drive_download_to_bytes(service, file_id: str) -> bytes:
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh.read().decode("utf-8", errors="ignore")
+    return fh.getvalue()
 
 
-def drive_upload_or_update(service, folder_id: str, local_path: Path, remote_name: Optional[str] = None) -> str:
-    remote_name = remote_name or local_path.name
-    existing_id = drive_find_by_name(service, folder_id, remote_name)
-    media = MediaFileUpload(str(local_path), resumable=True)
+def drive_upload_file(service, folder_id: str, local_path: Path, mimetype: str, drive_name: Optional[str] = None) -> str:
+    name = drive_name or local_path.name
+    existing_id = drive_find_by_name(service, folder_id, name)
+
+    media = MediaFileUpload(str(local_path), mimetype=mimetype, resumable=True)
 
     if existing_id:
         updated = service.files().update(
             fileId=existing_id,
             media_body=media,
             fields="id",
-            supportsAllDrives=True,
+            supportsAllDrives=True
         ).execute()
         return updated["id"]
 
     created = service.files().create(
-        body={"name": remote_name, "parents": [folder_id]},
+        body={"name": name, "parents": [folder_id]},
         media_body=media,
         fields="id",
-        supportsAllDrives=True,
+        supportsAllDrives=True
     ).execute()
     return created["id"]
 
 
-# =========================
-# State (on Drive)
-# =========================
-def load_state_from_drive(service, folder_id: str) -> dict:
+# ================== STATE ==================
+def load_state_from_drive(service, folder_id: str, state_name: str) -> Dict:
     state = {"seen_program_ids": []}
-    if not service or not folder_id:
-        return state
-
-    fid = drive_find_by_name(service, folder_id, STATE_DRIVE_NAME)
-    if not fid:
-        print("[State] No state.json on Drive yet. Start fresh.")
-        return state
-
     try:
-        txt = drive_download_text(service, fid)
-        obj = json.loads(txt) if txt.strip() else {}
-        if isinstance(obj, dict) and "seen_program_ids" in obj:
-            return obj
+        sid = drive_find_by_name(service, folder_id, state_name)
+        if not sid:
+            print("[State] No state.json on Drive yet. Start fresh.")
+            return state
+        raw = drive_download_to_bytes(service, sid)
+        state = json.loads(raw.decode("utf-8", errors="ignore"))
+        if "seen_program_ids" not in state or not isinstance(state["seen_program_ids"], list):
+            state["seen_program_ids"] = []
+        print(f"[State] Loaded from Drive: seen={len(state['seen_program_ids'])}")
+        return state
     except Exception as e:
-        print(f"[State] Load state failed: {e}")
-
-    return state
-
-
-def save_state_to_drive(service, folder_id: str, state: dict) -> None:
-    if not service or not folder_id:
-        return
-    tmp = OUT_DIR / "_state_tmp.json"
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    fid = drive_upload_or_update(service, folder_id, tmp, remote_name=STATE_DRIVE_NAME)
-    print(f"[State] Uploaded state.json to Drive (fileId={fid}).")
-    try:
-        tmp.unlink()
-    except Exception:
-        pass
+        print(f"[State] Load failed, start fresh: {e}")
+        return {"seen_program_ids": []}
 
 
-# =========================
-# TWR360 parsing
-# =========================
-def extract_episode_list(ministry_html: str) -> List[Episode]:
-    """
-    Lấy các link Listen từ trang ministry:
-    /programs/view/id%2C1146101/action%2Caudio/lang%2C1
-    """
-    hrefs = re.findall(r'href="([^"]+)"', ministry_html, flags=re.I)
-    out: List[Episode] = []
-    seen: Set[str] = set()
-
-    for href in hrefs:
-        if "programs/view/" not in href:
-            continue
-        if "action" not in href:
-            continue
-        if "audio" not in href:
-            continue
-
-        full = urljoin("https://www.twr360.org/", href)
-        full_dec = unquote(full)
-
-        m = re.search(r"id,(\d+)", full_dec)
-        if not m:
-            continue
-        pid = m.group(1)
-        if pid in seen:
-            continue
-        seen.add(pid)
-
-        out.append(Episode(program_id=pid, listen_url=full_dec))
-
-    return out
+def save_state_to_drive(service, folder_id: str, state_name: str, state: Dict) -> None:
+    tmp = OUT_DIR / state_name
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    fid = drive_upload_file(service, folder_id, tmp, mimetype="application/json", drive_name=state_name)
+    print(f"[State] Uploaded {state_name} to Drive (fileId={fid}).")
 
 
-def parse_title_and_date(html: str) -> Tuple[Optional[str], Optional[str]]:
-    title = None
-    m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html, flags=re.I)
-    if m:
-        title = m.group(1).strip()
+# ================== MAIN ==================
+def main():
+    s = http_session()
 
-    if not title:
-        m = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.I | re.S)
-        if m:
-            t = re.sub(r"<[^>]+>", "", m.group(1))
-            title = re.sub(r"\s+", " ", t).strip() or None
+    drive = init_drive_service()
+    folder_id = ensure_folder(drive, GDRIVE_FOLDER_ID) if drive else None
+    if not drive or not folder_id:
+        raise RuntimeError("Drive not configured (GDRIVE_FOLDER_ID / GDRIVE_OAUTH_TOKEN_JSON).")
 
-    date_iso = None
-    dm = re.search(
-        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b",
-        html,
-    )
-    if dm:
-        try:
-            d = dt.datetime.strptime(dm.group(0), "%B %d, %Y").date()
-            date_iso = d.isoformat()
-        except Exception:
-            date_iso = None
+    state = load_state_from_drive(drive, folder_id, STATE_DRIVE_NAME)
+    seen = set(str(x) for x in state.get("seen_program_ids", []))
 
-    return title, date_iso
-
-
-def decode_mediahit_to_audio_url(mediahit_url: str) -> Optional[str]:
-    """
-    mediahit url:
-      https://www.twr360.org/mediahit/id%2C6566871/url%2C<base64>~
-    hoặc /mediahit/...
-    Decode base64 -> direct audio url
-    """
-    try:
-        u = unquote(mediahit_url)
-        # bắt cả url, và url%2C
-        m = re.search(r"url,([^/?#]+)", u)
-        if not m:
-            return None
-        b64 = m.group(1).strip().replace("~", "=")
-
-        pad = (-len(b64)) % 4
-        if pad:
-            b64 += "=" * pad
-
-        raw = base64.b64decode(b64.encode("utf-8")).decode("utf-8", errors="ignore").strip()
-        return raw if raw.startswith("http") else None
-    except Exception:
-        return None
-
-
-def extract_audio_url_from_listen_page(html: str, base_url: str) -> Optional[str]:
-    """
-    FIX CHÍNH:
-    - Bắt cả link mediahit tương đối (/mediahit/...) lẫn tuyệt đối
-    - Ưu tiên đúng link có anchor text 'Audio'
-    """
-    # 1) Ưu tiên <a href="...mediahit...">Audio</a>
-    m = re.search(r'<a[^>]+href="([^"]*mediahit[^"]*)"[^>]*>\s*Audio\s*</a>', html, flags=re.I)
-    if m:
-        href = m.group(1)
-        full = urljoin(base_url, href)
-        au = decode_mediahit_to_audio_url(full)
-        if au:
-            return au
-
-    # 2) Fallback: lấy tất cả href chứa mediahit (kể cả tương đối)
-    hrefs = re.findall(r'href="([^"]*mediahit[^"]*)"', html, flags=re.I)
-    candidates: List[str] = []
-    for href in hrefs:
-        full = urljoin(base_url, href)
-        au = decode_mediahit_to_audio_url(full)
-        if not au:
-            continue
-        low = au.lower()
-        if any(low.endswith(ext) for ext in [".mp3", ".m4a", ".aac", ".mp4", ".m4b"]):
-            candidates.append(au)
-
-    if not candidates:
-        return None
-
-    # 3) Chọn “best”: ưu tiên bitrate lớn hơn nếu có _64/_128...
-    def score(u: str) -> Tuple[int, int]:
-        ul = u.lower()
-        ext_rank = 0
-        if ul.endswith(".m4a"):
-            ext_rank = 3
-        elif ul.endswith(".mp3"):
-            ext_rank = 2
-        elif ul.endswith(".aac"):
-            ext_rank = 1
-        br = 0
-        mm = re.search(r"[_\-](\d{2,3})\.(mp3|m4a|aac|mp4|m4b)\b", ul)
-        if mm:
-            try:
-                br = int(mm.group(1))
-            except Exception:
-                br = 0
-        return (ext_rank, br)
-
-    candidates.sort(key=score, reverse=True)
-    return candidates[0]
-
-
-def safe_filename(s: str, max_len: int = 180) -> str:
-    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:max_len].rstrip()
-
-
-# =========================
-# Main
-# =========================
-def main() -> int:
-    folder_id_env = (os.environ.get("GDRIVE_FOLDER_ID") or "").strip()
-
-    drive = init_drive()
-    drive_folder = ensure_folder_access(drive, folder_id_env) if drive and folder_id_env else None
-
-    state = load_state_from_drive(drive, drive_folder) if (drive and drive_folder) else {"seen_program_ids": []}
-    seen: Set[str] = set(str(x) for x in (state.get("seen_program_ids") or []))
-
-    print(f"[Fetch] {MINISTRY_URL}")
-    st, ministry_html = http_get_text(MINISTRY_URL)
-    print(f"[Fetch] status={st} bytes={len(ministry_html.encode('utf-8', errors='ignore'))}")
-    if st != 200:
-        raise RuntimeError(f"Fetch ministry page failed: HTTP {st}")
-
-    eps = extract_episode_list(ministry_html)
-    print(f"[Parse] Found {len(eps)} episode(s) from ministry page.")
-
-    new_eps = [e for e in eps if e.program_id not in seen][:MAX_PER_RUN]
-    print(f"[Plan] New episodes this run: {len(new_eps)} (max {MAX_PER_RUN}).")
+    eps = get_latest_episodes(s)
+    # newest first; only pick ones not seen
+    new_eps = [e for e in eps if e.program_id not in seen]
+    plan = new_eps[:MAX_PER_RUN]
+    print(f"[Plan] New episodes this run: {len(plan)} (max {MAX_PER_RUN}).")
 
     uploaded = 0
     failed = 0
 
-    for i, ep in enumerate(new_eps, 1):
-        pid = ep.program_id
-        print(f"[{i}/{len(new_eps)}] program_id={pid}")
-
+    for idx, ep in enumerate(plan, 1):
+        print(f"[{idx}/{len(plan)}] program_id={ep.program_id}")
         try:
-            st2, listen_html = http_get_text(ep.listen_url)
-            if st2 != 200:
-                raise RuntimeError(f"listen page HTTP {st2}")
+            st, html = fetch_text(s, ep.program_url)
+            if st != 200 or len(html) < 2000:
+                raise RuntimeError(f"Program page fetch failed (status={st}, bytes={len(html)})")
 
-            title, date_iso = parse_title_and_date(listen_html)
-            title = title or f"TurningPoint_{pid}"
-            date_iso = date_iso or dt.date.today().isoformat()
+            title, yyyy_mm_dd = extract_title_and_date(html, fallback_title=ep.title_hint)
+            base = "https://www.twr360.org"
 
-            audio_url = extract_audio_url_from_listen_page(listen_html, ep.listen_url)
+            mediahits = find_mediahit_links(html, base_url=base)
+            if not mediahits:
+                raise RuntimeError("No mediahit links found on program view page.")
+
+            direct_urls = []
+            for mh in mediahits:
+                direct = decode_mediahit_to_direct_url(mh)
+                if direct:
+                    direct_urls.append(direct)
+
+            # Keep only likely-audio URLs
+            direct_urls = [u for u in direct_urls if ".mp3" in u.lower() or "audio" in u.lower()]
+            if not direct_urls:
+                # still keep any decoded URL
+                for mh in mediahits:
+                    direct = decode_mediahit_to_direct_url(mh)
+                    if direct:
+                        direct_urls.append(direct)
+
+            if not direct_urls:
+                raise RuntimeError("Cannot decode any mediahit -> direct URL.")
+
+            audio_url = choose_best_audio_url(direct_urls)
             if not audio_url:
-                raise RuntimeError("Cannot find audio mediahit on listen page (Downloads -> Audio).")
+                raise RuntimeError("No usable audio URL selected.")
 
-            # file ext
-            low = audio_url.lower()
-            ext = ".mp3"
-            for eext in [".m4a", ".mp3", ".aac", ".mp4", ".m4b"]:
-                if low.endswith(eext):
-                    ext = eext
-                    break
+            # Decide file extension
+            path = urlparse(audio_url).path
+            ext = Path(path).suffix.lower() or ".mp3"
+            if ext not in [".mp3", ".m4a", ".aac", ".wav", ".mp4"]:
+                ext = ".mp3"
 
-            filename = safe_filename(f"{date_iso} - {title} - {pid}{ext}")
-            local_path = OUT_DIR / filename
+            date_prefix = f"{yyyy_mm_dd} - " if yyyy_mm_dd else ""
+            fname = sanitize_filename(f"{date_prefix}{title}{ext}")
+            local_path = OUT_DIR / fname
 
-            print(f"[Audio] {audio_url}")
-            print(f"[DL] -> {local_path.name}")
-            download_file(audio_url, local_path)
+            print(f"  [DL] {audio_url}")
+            download_audio(s, audio_url, local_path)
+            if not local_path.exists() or local_path.stat().st_size < 10_000:
+                raise RuntimeError(f"Downloaded file looks wrong (size={local_path.stat().st_size if local_path.exists() else 0})")
 
-            if drive and drive_folder:
-                fid = drive_upload_or_update(drive, drive_folder, local_path, remote_name=local_path.name)
-                uploaded += 1
-                print(f"[Drive] Uploaded: {local_path.name} (fileId={fid})")
-                try:
-                    local_path.unlink()
-                except Exception:
-                    pass
-            else:
-                print("[Drive] Skip upload (missing Drive creds/folder). Kept local file.")
+            # Upload to Drive
+            mime = "audio/mpeg" if ext == ".mp3" else "application/octet-stream"
+            fid = drive_upload_file(drive, folder_id, local_path, mimetype=mime)
+            print(f"  [Drive] Uploaded: {fname} (fileId={fid})")
 
-            # mark seen only when success
-            seen.add(pid)
+            # Mark seen only after successful upload
+            seen.add(ep.program_id)
+            state["seen_program_ids"] = sorted(list(seen), key=lambda x: int(x))
+            uploaded += 1
+
+            # Optional cleanup local
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         except Exception as e:
             failed += 1
-            print(f"[FAIL] program_id={pid}: {e}")
+            print(f"[FAIL] program_id={ep.program_id}: {e}")
 
-        if i < len(new_eps):
+        if idx < len(plan):
             time.sleep(SLEEP_SECONDS)
 
-    state["seen_program_ids"] = sorted(seen, key=lambda x: int(x) if x.isdigit() else x)
-    if drive and drive_folder:
-        save_state_to_drive(drive, drive_folder, state)
+    # Save state even if some failed (but only successful are marked seen)
+    save_state_to_drive(drive, folder_id, STATE_DRIVE_NAME, state)
 
-    print(f"Done. Uploaded {uploaded} episode(s). Seen total={len(seen)}. Failed={failed}.")
-    return 0
+    print(f"Done. Uploaded {uploaded} episode(s). Failed={failed}. Seen total={len(seen)}.")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
